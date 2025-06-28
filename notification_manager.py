@@ -100,7 +100,7 @@ class NotificationManager:
             logger.info(f"Stopped notifications for user {user_id}")
     
     def pause_notifications(self, user_id: int):
-        """Приостанавливает уведомления до следующего дня"""
+        """Приостанавливает уведомления до следующего времени начала"""
         if user_id in self.active_notifications:
             self.active_notifications[user_id]['active'] = False
             self.active_notifications[user_id]['last_response_time'] = datetime.now(self.moscow_tz)
@@ -108,7 +108,7 @@ class NotificationManager:
             # Сохраняем изменения в хранилище
             self._save_notifications()
             
-            logger.info(f"Paused notifications for user {user_id} until next day")
+            logger.info(f"Paused notifications for user {user_id} until next start time")
     
     async def _notification_loop(self, user_id: int, notification_data: Dict):
         """Основной цикл отправки уведомлений"""
@@ -126,7 +126,7 @@ class NotificationManager:
                         # Сохраняем изменения в хранилище
                         self._save_notifications()
                         
-                        logger.info(f"Resumed notifications for user {user_id}")
+                        logger.info(f"Resumed notifications for user {user_id} at {next_start.strftime('%H:%M')}")
                 
                 if notification_data['active']:
                     # Проверяем, находимся ли мы в активном временном окне
@@ -151,16 +151,21 @@ class NotificationManager:
     
     def _get_next_start_time(self, notification_data: Dict) -> datetime:
         """Вычисляет время следующего запуска уведомлений"""
-        now = datetime.now(self.moscow_tz)
-        next_start = now.replace(
+        # Используем время последнего ответа как базовое время
+        if notification_data['last_response_time']:
+            base_time = notification_data['last_response_time']
+        else:
+            base_time = datetime.now(self.moscow_tz)
+        
+        next_start = base_time.replace(
             hour=notification_data['start_hour'],
             minute=notification_data['start_minute'],
             second=0,
             microsecond=0
         )
         
-        # Если время уже прошло сегодня, переносим на завтра
-        if next_start <= now:
+        # Если время начала уже прошло в день последнего ответа, переносим на следующий день
+        if next_start <= base_time:
             next_start += timedelta(days=1)
         
         return next_start
