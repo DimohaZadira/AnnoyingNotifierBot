@@ -1,0 +1,11 @@
+{
+  "12345": {
+    "message": "Простой тест",
+    "interval_minutes": 1,
+    "start_hour": 14,
+    "start_minute": 41,
+    "active": false,
+    "last_response_time": "2025-06-28T14:41:26.979828+03:00",
+    "last_sent": "2025-06-28T14:41:16.974643+03:00"
+  }
+}

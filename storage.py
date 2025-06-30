@@ -18,14 +18,17 @@ class NotificationStorage:
             # Подготавливаем данные для сохранения
             serializable_notifications = {}
             
-            for user_id, notification_data in notifications.items():
+            for chat_id, notification_data in notifications.items():
                 # Создаем копию данных без асинхронных задач
                 serializable_data = {
                     'message': notification_data['message'],
                     'interval_minutes': notification_data['interval_minutes'],
                     'start_hour': notification_data['start_hour'],
                     'start_minute': notification_data['start_minute'],
-                    'active': notification_data['active']
+                    'active': notification_data['active'],
+                    'chat_id': notification_data.get('chat_id', chat_id),
+                    'message_thread_id': notification_data.get('message_thread_id'),
+                    'tagged_users': notification_data.get('tagged_users', [])
                 }
                 
                 # Сохраняем время последнего ответа если есть
@@ -36,7 +39,11 @@ class NotificationStorage:
                 if notification_data.get('last_sent'):
                     serializable_data['last_sent'] = notification_data['last_sent'].isoformat()
                 
-                serializable_notifications[str(user_id)] = serializable_data
+                # Сохраняем список ответивших пользователей
+                if notification_data.get('responded_users'):
+                    serializable_data['responded_users'] = list(notification_data['responded_users'])
+                
+                serializable_notifications[str(chat_id)] = serializable_data
             
             # Сохраняем в файл
             with open(self.storage_file, 'w', encoding='utf-8') as f:
@@ -62,8 +69,8 @@ class NotificationStorage:
             # Восстанавливаем данные
             notifications = {}
             
-            for user_id_str, notification_data in data.items():
-                user_id = int(user_id_str)
+            for chat_id_str, notification_data in data.items():
+                chat_id = int(chat_id_str)
                 
                 # Восстанавливаем datetime объекты
                 restored_data = {
@@ -72,7 +79,10 @@ class NotificationStorage:
                     'start_hour': notification_data['start_hour'],
                     'start_minute': notification_data['start_minute'],
                     'active': notification_data['active'],
-                    'task': None  # Задача будет создана заново
+                    'task': None,  # Задача будет создана заново
+                    'chat_id': notification_data.get('chat_id', chat_id),
+                    'message_thread_id': notification_data.get('message_thread_id'),
+                    'tagged_users': notification_data.get('tagged_users', [])
                 }
                 
                 # Восстанавливаем время последнего ответа
@@ -82,7 +92,7 @@ class NotificationStorage:
                             notification_data['last_response_time']
                         ).replace(tzinfo=self.moscow_tz)
                     except Exception as e:
-                        logger.warning(f"Error parsing last_response_time for user {user_id}: {e}")
+                        logger.warning(f"Error parsing last_response_time for chat {chat_id}: {e}")
                         restored_data['last_response_time'] = None
                 
                 # Восстанавливаем время последней отправки
@@ -92,10 +102,16 @@ class NotificationStorage:
                             notification_data['last_sent']
                         ).replace(tzinfo=self.moscow_tz)
                     except Exception as e:
-                        logger.warning(f"Error parsing last_sent for user {user_id}: {e}")
+                        logger.warning(f"Error parsing last_sent for chat {chat_id}: {e}")
                         restored_data['last_sent'] = None
                 
-                notifications[user_id] = restored_data
+                # Восстанавливаем список ответивших пользователей
+                if notification_data.get('responded_users'):
+                    restored_data['responded_users'] = set(notification_data['responded_users'])
+                else:
+                    restored_data['responded_users'] = set()
+                
+                notifications[chat_id] = restored_data
             
             logger.info(f"Loaded {len(notifications)} notifications from {self.storage_file}")
             return notifications

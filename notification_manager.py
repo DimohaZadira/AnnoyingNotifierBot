@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import pytz
 from telegram import Bot
 from telegram.error import TelegramError
@@ -24,15 +24,15 @@ class NotificationManager:
         try:
             saved_notifications = self.storage.load_notifications()
             
-            for user_id, notification_data in saved_notifications.items():
-                self.active_notifications[user_id] = notification_data
+            for chat_id, notification_data in saved_notifications.items():
+                self.active_notifications[chat_id] = notification_data
                 
                 # Создаем новую задачу для восстановленного уведомления
                 notification_data['task'] = asyncio.create_task(
-                    self._notification_loop(user_id, notification_data)
+                    self._notification_loop(chat_id, notification_data)
                 )
                 
-                logger.info(f"Restored notification for user {user_id}: {notification_data['message']}")
+                logger.info(f"Restored notification for chat {chat_id}: {notification_data['message']}")
             
             if saved_notifications:
                 logger.info(f"Restored {len(saved_notifications)} notifications from storage")
@@ -47,8 +47,9 @@ class NotificationManager:
         except Exception as e:
             logger.error(f"Error saving notifications: {e}")
         
-    async def start_notification(self, user_id: int, message: str, interval_minutes: int, start_time: str):
-        """Запускает уведомления для пользователя"""
+    async def start_notification(self, chat_id: int, message: str, interval_minutes: int, start_time: str, 
+                                tagged_users: Optional[List[int]] = None, message_thread_id: Optional[int] = None):
+        """Запускает уведомления для чата (личного или группового)"""
         try:
             # Парсим время начала (формат HH:MM)
             start_hour, start_minute = map(int, start_time.split(':'))
@@ -60,31 +61,35 @@ class NotificationManager:
                 'start_minute': start_minute,
                 'active': True,
                 'last_response_time': None,
-                'task': None
+                'task': None,
+                'chat_id': chat_id,
+                'message_thread_id': message_thread_id,  # ID топика
+                'tagged_users': tagged_users or [],
+                'responded_users': set()  # Пользователи, которые ответили
             }
             
             # Останавливаем предыдущие уведомления если есть
-            if user_id in self.active_notifications:
-                await self.stop_notification(user_id)
+            if chat_id in self.active_notifications:
+                await self.stop_notification(chat_id)
             
-            self.active_notifications[user_id] = notification_data
+            self.active_notifications[chat_id] = notification_data
             notification_data['task'] = asyncio.create_task(
-                self._notification_loop(user_id, notification_data)
+                self._notification_loop(chat_id, notification_data)
             )
             
             # Сохраняем в хранилище
             self._save_notifications()
             
-            logger.info(f"Started notifications for user {user_id}: {message} every {interval_minutes} minutes starting at {start_time}")
+            logger.info(f"Started notifications for chat {chat_id} (topic: {message_thread_id}): {message} every {interval_minutes} minutes starting at {start_time}")
             
         except Exception as e:
-            logger.error(f"Error starting notification for user {user_id}: {e}")
+            logger.error(f"Error starting notification for chat {chat_id}: {e}")
             raise
     
-    async def stop_notification(self, user_id: int):
-        """Останавливает уведомления для пользователя"""
-        if user_id in self.active_notifications:
-            notification_data = self.active_notifications[user_id]
+    async def stop_notification(self, chat_id: int):
+        """Останавливает уведомления для чата"""
+        if chat_id in self.active_notifications:
+            notification_data = self.active_notifications[chat_id]
             if notification_data['task']:
                 notification_data['task'].cancel()
                 try:
@@ -92,25 +97,63 @@ class NotificationManager:
                 except asyncio.CancelledError:
                     pass
             
-            del self.active_notifications[user_id]
+            del self.active_notifications[chat_id]
             
             # Сохраняем изменения в хранилище
             self._save_notifications()
             
-            logger.info(f"Stopped notifications for user {user_id}")
+            logger.info(f"Stopped notifications for chat {chat_id}")
     
-    def pause_notifications(self, user_id: int):
+    def pause_notifications(self, chat_id: int, user_id: Optional[int] = None):
         """Приостанавливает уведомления до следующего времени начала"""
-        if user_id in self.active_notifications:
-            self.active_notifications[user_id]['active'] = False
-            self.active_notifications[user_id]['last_response_time'] = datetime.now(self.moscow_tz)
+        if chat_id in self.active_notifications:
+            notification_data = self.active_notifications[chat_id]
+            notification_data['active'] = False
+            notification_data['last_response_time'] = datetime.now(self.moscow_tz)
+            
+            # Если указан пользователь и есть тегированные пользователи, добавляем его в список ответивших
+            if user_id and notification_data.get('tagged_users'):
+                notification_data['responded_users'].add(user_id)
+                # Сбрасываем список ответивших если все тегированные пользователи ответили
+                if notification_data['responded_users'] == set(notification_data['tagged_users']):
+                    notification_data['responded_users'].clear()
             
             # Сохраняем изменения в хранилище
             self._save_notifications()
             
-            logger.info(f"Paused notifications for user {user_id} until next start time")
+            logger.info(f"Paused notifications for chat {chat_id} until next start time")
     
-    async def _notification_loop(self, user_id: int, notification_data: Dict):
+    def handle_user_response(self, chat_id: int, user_id: int, username: str = None):
+        """Обрабатывает ответ пользователя в групповом чате"""
+        if chat_id in self.active_notifications:
+            notification_data = self.active_notifications[chat_id]
+            tagged_users = notification_data.get('tagged_users', [])
+            responded_users = notification_data['responded_users']
+            changed = False
+
+            # Добавляем user_id, если он есть в tagged_users
+            if user_id in tagged_users:
+                responded_users.add(user_id)
+                changed = True
+            # Добавляем username, если он есть в tagged_users
+            if username:
+                username_clean = username.lstrip('@')
+                if username_clean in tagged_users:
+                    responded_users.add(username_clean)
+                    changed = True
+
+            if changed:
+                # Если все тегированные пользователи ответили, приостанавливаем уведомления
+                if set(tagged_users) == responded_users:
+                    notification_data['active'] = False
+                    notification_data['last_response_time'] = datetime.now(self.moscow_tz)
+                    notification_data['responded_users'].clear()
+                    logger.info(f"All tagged users responded in chat {chat_id}, pausing notifications until next start time")
+                else:
+                    logger.info(f"User {user_id} ({username}) responded in chat {chat_id}, {len(responded_users)}/{len(tagged_users)} users responded")
+                self._save_notifications()
+    
+    async def _notification_loop(self, chat_id: int, notification_data: Dict):
         """Основной цикл отправки уведомлений"""
         while True:
             try:
@@ -123,17 +166,21 @@ class NotificationManager:
                         notification_data['active'] = True
                         notification_data['last_response_time'] = None
                         
+                        # Сбрасываем список ответивших пользователей при возобновлении
+                        if notification_data.get('tagged_users'):
+                            notification_data['responded_users'].clear()
+                        
                         # Сохраняем изменения в хранилище
                         self._save_notifications()
                         
-                        logger.info(f"Resumed notifications for user {user_id} at {next_start.strftime('%H:%M')}")
+                        logger.info(f"Resumed notifications for chat {chat_id} at {next_start.strftime('%H:%M')}")
                 
                 if notification_data['active']:
                     # Проверяем, находимся ли мы в активном временном окне
                     if self._is_in_active_window(now, notification_data):
                         # Проверяем, нужно ли отправить уведомление
                         if self._should_send_notification(now, notification_data):
-                            await self._send_notification(user_id, notification_data['message'])
+                            await self._send_notification(chat_id, notification_data)
                             notification_data['last_sent'] = now
                             
                             # Сохраняем время последней отправки
@@ -143,10 +190,10 @@ class NotificationManager:
                 await asyncio.sleep(60)
                 
             except asyncio.CancelledError:
-                logger.info(f"Notification loop cancelled for user {user_id}")
+                logger.info(f"Notification loop cancelled for chat {chat_id}")
                 break
             except Exception as e:
-                logger.error(f"Error in notification loop for user {user_id}: {e}")
+                logger.error(f"Error in notification loop for chat {chat_id}: {e}")
                 await asyncio.sleep(60)
     
     def _get_next_start_time(self, notification_data: Dict) -> datetime:
@@ -192,13 +239,72 @@ class NotificationManager:
         time_since_last = now - notification_data['last_sent']
         return time_since_last.total_seconds() >= notification_data['interval_minutes'] * 60
     
-    async def _send_notification(self, user_id: int, message: str):
-        """Отправляет уведомление пользователю"""
+    async def _send_notification(self, chat_id: int, notification_data: Dict):
+        """Отправляет уведомление в чат"""
         try:
-            await self.bot.send_message(chat_id=user_id, text=message)
-            logger.info(f"Sent notification to user {user_id}: {message}")
+            message = notification_data['message']
+            tagged_users = notification_data.get('tagged_users', [])
+            responded_users = notification_data.get('responded_users', set())
+            message_thread_id = notification_data.get('message_thread_id')
+            
+            # Если есть тегированные пользователи, добавляем теги только тех, кто ещё не ответил
+            if tagged_users:
+                user_tags = []
+                for user in tagged_users:
+                    # Пропускаем тех, кто уже ответил
+                    if user in responded_users:
+                        continue
+                        
+                    if isinstance(user, int):
+                        # Это user_id (число)
+                        try:
+                            member = await self.bot.get_chat_member(chat_id, user)
+                            if member.user.username:
+                                user_tags.append(f"@{member.user.username}")
+                            else:
+                                user_tags.append(f'<a href="tg://user?id={user}">{member.user.first_name}</a>')
+                        except TelegramError as e:
+                            logger.warning(f"Could not get user info for {user}: {e}")
+                            user_tags.append(f'<a href="tg://user?id={user}">Пользователь</a>')
+                    elif isinstance(user, str):
+                        # Это username (строка)
+                        username = user.lstrip('@')  # Убираем @ если есть
+                        user_tags.append(f"@{username}")
+                    else:
+                        logger.warning(f"Unknown user type: {type(user)} for user {user}")
+                
+                if user_tags:
+                    message += f"\n\n{' '.join(user_tags)}"
+            
+            # Отправляем сообщение с учетом топика
+            send_params = {
+                'chat_id': chat_id,
+                'text': message,
+                'parse_mode': 'HTML'
+            }
+            
+            if message_thread_id is not None:
+                send_params['message_thread_id'] = message_thread_id
+            
+            await self.bot.send_message(**send_params)
+            logger.info(f"Sent notification to chat {chat_id} (topic: {message_thread_id}): {notification_data['message']}")
+            
         except TelegramError as e:
-            logger.error(f"Failed to send notification to user {user_id}: {e}")
+            logger.error(f"Failed to send notification to chat {chat_id}: {e}")
+            # Если HTML не сработал, пробуем без разметки
+            try:
+                send_params = {
+                    'chat_id': chat_id,
+                    'text': message
+                }
+                
+                if message_thread_id is not None:
+                    send_params['message_thread_id'] = message_thread_id
+                
+                await self.bot.send_message(**send_params)
+                logger.info(f"Sent notification without markup to chat {chat_id}")
+            except TelegramError as e2:
+                logger.error(f"Failed to send notification without markup to chat {chat_id}: {e2}")
     
     def get_active_notifications(self) -> Dict[int, Dict]:
         """Возвращает активные уведомления"""
@@ -212,7 +318,7 @@ class NotificationManager:
         """Очищает все уведомления"""
         try:
             # Останавливаем все задачи
-            for user_id, notification_data in self.active_notifications.items():
+            for chat_id, notification_data in self.active_notifications.items():
                 if notification_data['task']:
                     notification_data['task'].cancel()
                     try:
